@@ -1,0 +1,19 @@
+# The upstream checkout this port is generated from.
+dsh-harness/
+
+# Local build toolchain and the unpacked runtime.
+toolchain/
+runtime/
+
+# Build inputs. scripts/build-node-runtime.sh and scripts/build-android-tools.sh
+# download and repack these from public sources; together they are far past the
+# size a repository should carry, and every one of them is reproducible.
+android-app/app/src/main/assets/
+android-app/app/src/main/jniLibs/
+
+# Build output.
+dist/
+android-app/.gradle/
+android-app/build/
+android-app/app/build/
+android-app/local.properties
