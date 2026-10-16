@@ -57,7 +57,7 @@ public final class ProjectFilesProvider extends ContentProvider {
         int dot = name.lastIndexOf('.');
         if (dot >= 0) {
             String guessed = MimeTypeMap.getSingleton()
-                    .getMimeTypeFromExtension(name.substring(dot + 1).toLowerCase());
+                    .getMimeTypeFromExtension(name.substring(dot + 1).toLowerCase(java.util.Locale.ROOT));
             if (guessed != null) return guessed;
         }
         return "application/octet-stream";
@@ -97,7 +97,19 @@ public final class ProjectFilesProvider extends ContentProvider {
 
     @Override
     public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) {
-        throw new UnsupportedOperationException("project files are read-only");
+        File file;
+        try { file = resolve(uri); } catch (FileNotFoundException refused) { return null; }
+        String[] columns = projection == null
+                ? new String[] { android.provider.OpenableColumns.DISPLAY_NAME, android.provider.OpenableColumns.SIZE }
+                : projection;
+        android.database.MatrixCursor cursor = new android.database.MatrixCursor(columns, 1);
+        Object[] values = new Object[columns.length];
+        for (int index = 0; index < columns.length; index++) {
+            if (android.provider.OpenableColumns.DISPLAY_NAME.equals(columns[index])) values[index] = file.getName();
+            if (android.provider.OpenableColumns.SIZE.equals(columns[index])) values[index] = file.length();
+        }
+        cursor.addRow(values);
+        return cursor;
     }
 
     @Override

@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
+    // The Android carrier and its tests contain Java only.
+    enableKotlin = false
     namespace = "com.dsh.android"
     compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
-        }
+        version = release(37)
     }
 
     defaultConfig {
@@ -15,9 +15,11 @@ android {
         // The runtime payload is a Node.js build with a 24 (Android 7.0) API
         // floor and a 64-bit-only ABI set.
         minSdk = 26
-        targetSdk = 36
-        versionCode = 2
-        versionName = "0.1.0"
+        targetSdk = 37
+        versionCode = 6
+        versionName = "0.1.4"
+        testInstrumentationRunner = providers.gradleProperty("dshTestRunner")
+            .getOrElse("com.dsh.android.RegressionInstrumentation")
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
@@ -49,4 +51,18 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
+    sourceSets.getByName("main").assets.directories.add("src/securityAssets")
+}
+
+dependencies {
+    implementation(libs.androidx.activity)
+    implementation(libs.androidx.core)
+    implementation(libs.androidx.webkit)
+    testImplementation(libs.junit)
+}
+
+// Include all production/test variants so platform API deprecations cannot return silently.
+tasks.withType<JavaCompile>().configureEach {
+    options.compilerArgs.addAll(listOf("-Xlint:deprecation", "-Werror"))
 }

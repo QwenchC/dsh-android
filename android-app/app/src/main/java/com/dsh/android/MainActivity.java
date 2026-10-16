@@ -29,7 +29,6 @@ import android.widget.Button;
 import android.widget.TextView;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
-import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.File;
@@ -43,34 +42,53 @@ import java.io.File;
  * it; every other capability it needs — uploads, downloads, back navigation —
  * is delegated to the platform.
  */
-public final class MainActivity extends Activity {
+public final class MainActivity extends androidx.activity.ComponentActivity {
 
-    private static final int REQUEST_FILE_CHOOSER = 1001;
     private static final int REQUEST_NOTIFICATIONS = 1002;
+    private static final String FILE_CHOOSER_PENDING = "dsh.fileChooserPending";
 
     private WebView web;
     private LinearLayout status;
     private TextView statusTitle;
     private TextView statusDetail;
     private ValueCallback<Uri[]> fileCallback;
+    private boolean fileChooserPending;
+    private final androidx.activity.result.ActivityResultLauncher<Intent> fileChooser = registerForActivityResult(
+            new androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult(), result -> {
+                fileChooserPending = false;
+                java.util.List<Uri> selected = new androidx.activity.result.contract.ActivityResultContracts.GetMultipleContents()
+                        .parseResult(result.getResultCode(), result.getData());
+                finishFileChoice(selected.isEmpty() ? null : selected.toArray(new Uri[0]));
+            });
     private String loadedUrl;
+    private String bridgeOrigin;
+    private Button start;
+    private boolean moving;
+    private PageBridge bridge;
 
     private DshRuntime.Listener listener;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        WebView.setWebContentsDebuggingEnabled(true);
+        fileChooserPending = savedInstanceState != null && savedInstanceState.getBoolean(FILE_CHOOSER_PENDING);
+        WebView.setWebContentsDebuggingEnabled((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0);
         setContentView(buildContentView());
         listener = (state, detail) -> runOnUiThread(() -> render(state, detail));
         requestNotificationPermission();
+        getOnBackPressedDispatcher().addCallback(this, new androidx.activity.OnBackPressedCallback(true) {
+            @Override public void handleOnBackPressed() {
+                if (web != null && web.canGoBack()) web.goBack();
+                else finish();
+            }
+        });
     }
 
     @Override
     protected void onStart() {
         super.onStart();
         DshApp.runtime().addListener(listener);
-        DshService.start(this);
+        if (DshApp.runtime().autoStart()) DshService.start(this);
     }
 
     @Override
@@ -79,40 +97,81 @@ public final class MainActivity extends Activity {
         DshApp.runtime().removeListener(listener);
     }
 
+    /** The bundled Harness UI requires scripts; navigation and native messages are origin restricted. */
+    @android.annotation.SuppressLint("SetJavaScriptEnabled")
+    private static void enableHarnessScripts(WebSettings settings) {
+        settings.setJavaScriptEnabled(true);
+    }
+
     /** The WebView plus the status panel shown until the server answers. */
     private View buildContentView() {
         FrameLayout root = new FrameLayout(this);
 
         web = new WebView(this);
         WebSettings settings = web.getSettings();
-        settings.setJavaScriptEnabled(true);
+        enableHarnessScripts(settings);
         settings.setDomStorageEnabled(true);
-        settings.setDatabaseEnabled(true);
         settings.setAllowFileAccess(false);
         settings.setAllowContentAccess(true);
-        settings.setMediaPlaybackRequiresUserGesture(false);
+        settings.setMediaPlaybackRequiresUserGesture(true);
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         settings.setUseWideViewPort(true);
         settings.setLoadWithOverviewMode(true);
         web.setId(R.id.web);
-        web.addJavascriptInterface(new PageBridge(this, DshApp.runtime()), PageBridge.NAME);
+        bridge = new PageBridge(this, DshApp.runtime());
         web.setWebViewClient(new WebViewClient() {
             @Override
+            public boolean onRenderProcessGone(WebView view, android.webkit.RenderProcessGoneDetail detail) {
+                // The dead renderer cannot be reused. Recreate only the UI; the Harness keeps its run.
+                removeBridge();
+                ViewGroup parent = (ViewGroup) view.getParent();
+                if (parent != null) parent.removeView(view);
+                view.destroy();
+                if (web == view) web = null;
+                loadedUrl = null;
+                if (!isFinishing() && !isDestroyed()) recreate();
+                return true;
+            }
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, android.webkit.WebResourceRequest request) {
+                String url = request.getUrl().toString();
+                if (trusted(url)) return false;
+                if (request.isForMainFrame() && "https".equals(request.getUrl().getScheme())) {
+                    try { startActivity(new Intent(Intent.ACTION_VIEW, request.getUrl()).addCategory(Intent.CATEGORY_BROWSABLE)); }
+                    catch (ActivityNotFoundException unavailable) { Toast.makeText(MainActivity.this, R.string.link_no_browser, Toast.LENGTH_SHORT).show(); }
+                }
+                return true;
+            }
+
+            @Override
+            public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, android.webkit.WebResourceRequest request) {
+                if (trusted(request.getUrl().toString())) return null;
+                return new android.webkit.WebResourceResponse("text/plain", "UTF-8", 403, "Forbidden",
+                        java.util.Collections.emptyMap(), new java.io.ByteArrayInputStream(new byte[0]));
+            }
+
+            @Override
             public void onPageFinished(WebView view, String url) {
-                // The page is a single application, so one installation per load
-                // covers every file reference it will ever render.
-                view.evaluateJavascript(PageBridge.SCRIPT, null);
+                if (trusted(url) && bridgeOrigin != null) view.evaluateJavascript(PageBridge.SCRIPT, null);
             }
         });
         web.setWebChromeClient(new WebChromeClient() {
             @Override
             public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
-                if (fileCallback != null) fileCallback.onReceiveValue(null);
+                // One system picker at a time. A restored picker result belongs to the old WebView,
+                // whose callback is cancelled on destruction, never to a new upload request.
+                if (fileChooserPending || isFinishing() || isDestroyed() || !trusted(view.getUrl())) {
+                    callback.onReceiveValue(null);
+                    return true;
+                }
                 fileCallback = callback;
+                fileChooserPending = true;
                 try {
-                    startActivityForResult(Intent.createChooser(params.createIntent(), getString(R.string.choose_file)), REQUEST_FILE_CHOOSER);
+                    fileChooser.launch(Intent.createChooser(params.createIntent(), getString(R.string.choose_file)));
                 } catch (ActivityNotFoundException noPicker) {
-                    fileCallback = null;
-                    return false;
+                    fileChooserPending = false;
+                    finishFileChoice(null);
+                    Toast.makeText(MainActivity.this, R.string.file_picker_unavailable, Toast.LENGTH_LONG).show();
                 }
                 return true;
             }
@@ -143,6 +202,9 @@ public final class MainActivity extends Activity {
         log.setText(R.string.open_log);
         log.setOnClickListener(view -> startActivity(new Intent(this, LogActivity.class)));
         status.addView(log);
+        start = startButton();
+        start.setVisibility(View.GONE);
+        status.addView(start);
 
         root.addView(status, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -157,7 +219,7 @@ public final class MainActivity extends Activity {
         column.addView(root, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        EdgeToEdge.apply(column);
+        EdgeToEdge.apply(this, column);
         return column;
     }
 
@@ -267,6 +329,7 @@ public final class MainActivity extends Activity {
         popup.getMenu().add(0, 5, 4, R.string.menu_battery);
         popup.getMenu().add(0, 6, 5, R.string.menu_stop);
         popup.getMenu().add(0, 8, 6, R.string.menu_move);
+        popup.getMenu().add(0, 9, 7, R.string.menu_execution);
         // A build under test on a device nobody is attached to needs a way to
         // prove the crash recorder works; a release build never offers it.
         if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
@@ -279,6 +342,7 @@ public final class MainActivity extends Activity {
     private DownloadListener downloadListener() {
         return (url, userAgent, contentDisposition, mimeType, contentLength) -> {
             try {
+                if (!trusted(url)) throw new IllegalArgumentException("download outside runtime origin");
                 DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
                 String cookie = CookieManager.getInstance().getCookie(url);
                 if (cookie != null) request.addRequestHeader("Cookie", cookie);
@@ -296,12 +360,21 @@ public final class MainActivity extends Activity {
 
     /** Renders one runtime state into the WebView and the status panel. */
     private void render(DshRuntime.State state, String detail) {
+        if (isDestroyed() || web == null) return;
+        start.setVisibility(state == DshRuntime.State.STOPPED || state == DshRuntime.State.FAILED
+                || state == DshRuntime.State.IDLE ? View.VISIBLE : View.GONE);
+        start.setEnabled(!DshApp.runtime().isRunning());
+        if (state != DshRuntime.State.READY) {
+            removeBridge();
+            if (loadedUrl != null) { loadedUrl = null; web.loadUrl("about:blank"); }
+        }
         switch (state) {
             case READY: {
                 status.setVisibility(View.GONE);
                 String url = DshApp.runtime().baseUrl();
                 if (url != null && !url.equals(loadedUrl)) {
                     loadedUrl = url;
+                    attachBridge(url);
                     web.loadUrl(url);
                 }
                 break;
@@ -316,13 +389,15 @@ public final class MainActivity extends Activity {
                 status.setVisibility(View.VISIBLE);
                 statusTitle.setText(R.string.state_stopped);
                 statusDetail.setText(detail);
-                status.addView(startButton());
                 break;
             }
+            case IDLE:
+            case STOPPING:
             default: {
                 status.setVisibility(View.VISIBLE);
-                statusTitle.setText(state == DshRuntime.State.INSTALLING
-                        ? R.string.state_installing : R.string.state_starting);
+                statusTitle.setText(state == DshRuntime.State.INSTALLING ? R.string.state_installing
+                        : state == DshRuntime.State.STOPPING ? R.string.state_stopping
+                        : state == DshRuntime.State.IDLE ? R.string.state_stopped : R.string.state_starting);
                 statusDetail.setText(detail);
                 break;
             }
@@ -333,7 +408,8 @@ public final class MainActivity extends Activity {
         Button start = new Button(this);
         start.setText(R.string.start_runtime);
         start.setOnClickListener(view -> {
-            status.removeView(start);
+            if (DshApp.runtime().isRunning()) return;
+            DshApp.runtime().setAutoStart(true);
             DshService.start(this);
         });
         return start;
@@ -376,6 +452,7 @@ public final class MainActivity extends Activity {
                 requestUnrestrictedBattery();
                 return true;
             case 6:
+                DshApp.runtime().setAutoStart(false);
                 DshApp.runtime().stop();
                 DshService.stop(this);
                 Toast.makeText(this, R.string.runtime_stopped, Toast.LENGTH_SHORT).show();
@@ -385,6 +462,9 @@ public final class MainActivity extends Activity {
             case 8:
                 moveProjectToSharedStorage();
                 return true;
+            case 9:
+                chooseExecutionMode();
+                return true;
             default:
                 return super.onOptionsItemSelected(item);
         }
@@ -392,7 +472,11 @@ public final class MainActivity extends Activity {
 
     /** Offers the two roots the application can actually write to. */
     private void chooseWorkspace() {
-        final File[] roots = new File[] { DshApp.runtime().workspace(), sharedWorkspace() };
+        if (DshApp.runtime().isRunning()) {
+            Toast.makeText(this, R.string.workspace_stop_first, Toast.LENGTH_LONG).show();
+            return;
+        }
+        final File[] roots = new File[] { DshApp.runtime().privateWorkspace(), sharedWorkspace() };
         String[] labels = new String[] {
                 getString(R.string.workspace_private, roots[0].getAbsolutePath()),
                 getString(R.string.workspace_shared, roots[1].getAbsolutePath()),
@@ -400,6 +484,7 @@ public final class MainActivity extends Activity {
         new AlertDialog.Builder(this)
                 .setTitle(R.string.menu_workspace)
                 .setItems(labels, (dialog, which) -> {
+                    if (which == 1 && !DshApp.runtime().hasSharedStorage()) { requestSharedStorage(); return; }
                     DshApp.runtime().setWorkspace(roots[which]);
                     Toast.makeText(this, R.string.workspace_saved, Toast.LENGTH_LONG).show();
                 })
@@ -419,7 +504,6 @@ public final class MainActivity extends Activity {
         // another application and the project folder appear in a file manager.
         if (Build.VERSION.SDK_INT < 30) return;
         if (!Environment.isExternalStorageManager()) return;
-        if (DshApp.runtime().hasSharedStorage()) return;
         SharedPreferences preferences = getSharedPreferences("dsh", MODE_PRIVATE);
         if (preferences.getBoolean("shared_storage_offered", false)) return;
         if (isFinishing() || isDestroyed()) return;
@@ -433,124 +517,83 @@ public final class MainActivity extends Activity {
                 .show();
     }
 
-    /**
-     * Move the project to shared storage, then work there.
-     *
-     * Copying is the point of the offer: a project that stayed behind in the
-     * application's private directory would make the new folder look empty and
-     * leave the user's files where no file manager reaches them. Nothing is
-     * overwritten, and the copy runs off the main thread because a project can
-     * be large.
-     */
+    /** Explain the stop before taking a consistent, resumable project copy. */
     private void moveProjectToSharedStorage() {
-        File target = new File(Environment.getExternalStorageDirectory(), "DSH");
-        if (!Environment.isExternalStorageManager() && Build.VERSION.SDK_INT >= 30) {
+        if (moving) return;
+        if (!DshApp.runtime().hasSharedStorage()) {
             Toast.makeText(this, R.string.move_needs_storage, Toast.LENGTH_LONG).show();
             return;
         }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.menu_move)
+                .setMessage(R.string.move_stop_message)
+                .setPositiveButton(R.string.move_stop_copy, (dialog, which) -> copyProjects())
+                .setNegativeButton(android.R.string.cancel, null).show();
+    }
+
+    private void copyProjects() {
+        if (moving) return;
+        moving = true;
         Toast.makeText(this, R.string.move_started, Toast.LENGTH_SHORT).show();
-        // A project lives either in the application's own workspace or directly
-        // under the Harness home, because that is what the Harness's directory
-        // picker offers as "Home". Both are copied; the Harness's own state
-        // directory is not, since sessions and credentials belong to the
-        // application and not to the project.
-        // The application's workspace contributes its contents, because it *is*
-        // the project. A directory under the Harness home is one project among
-        // several, so it is copied as a directory and keeps its name.
-        File workspace = DshApp.runtime().privateWorkspace();
-        java.util.List<File> projectDirectories = new java.util.ArrayList<>();
-        File[] homeEntries = RuntimeLayout.home(this).listFiles();
-        if (homeEntries != null) {
-            for (File entry : homeEntries) {
-                if (!".dsh".equals(entry.getName())) projectDirectories.add(entry);
-            }
-        }
-        new Thread(() -> {
-            int[] counts = copyTree(workspace, target);
-            for (File project : projectDirectories) {
-                int[] part = project.isDirectory()
-                        ? copyTree(project, new File(target, project.getName()))
-                        : copyFile(project, target);
-                counts[0] += part[0];
-                counts[1] += part[1];
-                counts[2] += part[2];
-            }
-            runOnUiThread(() -> {
-                DshApp.runtime().setSharedStorage(true);
-                DshApp.runtime().setWorkspace(target);
-                Toast.makeText(this, counts[0] == 0 && counts[1] == 0
-                                ? getString(R.string.move_none)
-                                : getString(R.string.move_done, counts[0], counts[1], target.getAbsolutePath()),
-                        Toast.LENGTH_LONG).show();
-            });
-        }, "dsh-move-project").start();
-    }
-
-    /**
-     * Copy a directory tree without replacing anything.
-     *
-     * @param source - the directory to read.
-     * @param target - the directory to fill.
-     * @returns copied, skipped (already present), and failed counts.
-     */
-    /**
-     * Copy one file into a directory without replacing anything.
-     *
-     * @param source - the file to read.
-     * @param target - the directory to fill.
-     * @returns copied, skipped, and failed counts.
-     */
-    private static int[] copyFile(File source, File target) {
-        int[] counts = new int[3];
-        if (!target.isDirectory() && !target.mkdirs()) {
-            counts[2]++;
-            return counts;
-        }
-        File destination = new File(target, source.getName());
-        if (destination.exists()) {
-            counts[1]++;
-            return counts;
-        }
         try {
-            java.nio.file.Files.copy(source.toPath(), destination.toPath());
-            counts[0]++;
-        } catch (java.io.IOException | RuntimeException cannotCopy) {
-            android.util.Log.w("DshMain", "could not move " + source, cannotCopy);
-            counts[2]++;
+            DshApp.runtime().migrate(sharedWorkspace()).whenComplete((result, failure) -> runOnUiThread(() -> {
+                moving = false;
+                if (isDestroyed() || isFinishing()) return;
+                render(DshApp.runtime().state(), DshApp.runtime().detail());
+                String message = failure != null ? getString(R.string.move_failed, failure.getMessage())
+                        : !result.complete() ? getString(R.string.move_failed, result.problems())
+                        : getString(R.string.move_verified, result.copied, result.identical, sharedWorkspace().getAbsolutePath());
+                new AlertDialog.Builder(this).setTitle(R.string.menu_move).setMessage(message)
+                        .setPositiveButton(android.R.string.ok, null).show();
+            }));
+        } catch (IllegalStateException busy) {
+            moving = false;
+            Toast.makeText(this, R.string.move_busy, Toast.LENGTH_LONG).show();
         }
-        return counts;
     }
 
-    private static int[] copyTree(File source, File target) {
-        int[] counts = new int[3];
-        if (!target.isDirectory() && !target.mkdirs()) {
-            counts[2]++;
-            return counts;
+    private void chooseExecutionMode() {
+        new AlertDialog.Builder(this).setTitle(R.string.menu_execution)
+                .setMessage(R.string.execution_explanation)
+                .setPositiveButton(R.string.execution_confirm, (dialog, which) -> saveExecutionMode(false))
+                .setNeutralButton(R.string.execution_autonomous, (dialog, which) ->
+                        new AlertDialog.Builder(this).setTitle(R.string.execution_autonomous)
+                                .setMessage(R.string.execution_warning)
+                                .setPositiveButton(R.string.execution_enable, (confirm, button) -> saveExecutionMode(true))
+                                .setNegativeButton(android.R.string.cancel, null).show())
+                .setNegativeButton(android.R.string.cancel, null).show();
+    }
+
+    private void saveExecutionMode(boolean autonomous) {
+        DshApp.runtime().setAutonomous(autonomous);
+        Toast.makeText(this, R.string.execution_saved, Toast.LENGTH_LONG).show();
+    }
+
+    private boolean trusted(String url) {
+        String origin = TrustedOrigin.from(DshApp.runtime().baseUrl());
+        return TrustedOrigin.allows(origin, url);
+    }
+
+    private void removeBridge() {
+        if (web != null && bridgeOrigin != null) {
+            if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.WEB_MESSAGE_LISTENER)) {
+                androidx.webkit.WebViewCompat.removeWebMessageListener(web, PageBridge.NAME);
+            }
         }
-        File[] children = source.listFiles();
-        if (children == null) return counts;
-        for (File child : children) {
-            File destination = new File(target, child.getName());
-            if (child.isDirectory()) {
-                int[] deeper = copyTree(child, destination);
-                counts[0] += deeper[0];
-                counts[1] += deeper[1];
-                counts[2] += deeper[2];
-                continue;
-            }
-            if (destination.exists()) {
-                counts[1]++;
-                continue;
-            }
-            try {
-                java.nio.file.Files.copy(child.toPath(), destination.toPath());
-                counts[0]++;
-            } catch (java.io.IOException | RuntimeException cannotCopy) {
-                android.util.Log.w("DshMain", "could not move " + child, cannotCopy);
-                counts[2]++;
-            }
-        }
-        return counts;
+        bridgeOrigin = null;
+    }
+
+    private void attachBridge(String url) {
+        removeBridge();
+        String origin = TrustedOrigin.from(url);
+        if (origin == null || !androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.WEB_MESSAGE_LISTENER)) return;
+        bridgeOrigin = origin;
+        androidx.webkit.WebViewCompat.addWebMessageListener(web, PageBridge.NAME, java.util.Collections.singleton(origin),
+                (view, message, sourceOrigin, isMainFrame, reply) -> {
+                    if (isMainFrame && trusted(sourceOrigin.toString()) && trusted(view.getUrl()) && message.getData() != null) {
+                        bridge.openFile(message.getData());
+                    }
+                });
     }
 
     /** Report a failure the platform raised, instead of ending the process. */
@@ -562,12 +605,10 @@ public final class MainActivity extends Activity {
     /** Sends the user to the all-files-access grant when the platform has one. */
     private void requestSharedStorage() {
         if (Build.VERSION.SDK_INT < 30) {
-            DshApp.runtime().setSharedStorage(true);
-            Toast.makeText(this, R.string.storage_granted, Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, R.string.storage_older_android, Toast.LENGTH_LONG).show();
             return;
         }
         if (Environment.isExternalStorageManager()) {
-            DshApp.runtime().setSharedStorage(true);
             Toast.makeText(this, R.string.storage_granted, Toast.LENGTH_SHORT).show();
             return;
         }
@@ -596,28 +637,34 @@ public final class MainActivity extends Activity {
             return;
         }
         try {
-            startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                    Uri.parse("package:" + getPackageName())));
-        } catch (ActivityNotFoundException noSettings) {
             startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            Toast.makeText(this, R.string.battery_settings_hint, Toast.LENGTH_LONG).show();
+        } catch (ActivityNotFoundException unavailable) {
+            Toast.makeText(this, R.string.battery_settings_missing, Toast.LENGTH_LONG).show();
         }
     }
 
     @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        if (requestCode == REQUEST_FILE_CHOOSER) {
-            if (fileCallback != null) {
-                fileCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data));
-                fileCallback = null;
-            }
-            return;
-        }
-        super.onActivityResult(requestCode, resultCode, data);
+    protected void onSaveInstanceState(Bundle state) {
+        state.putBoolean(FILE_CHOOSER_PENDING, fileChooserPending);
+        super.onSaveInstanceState(state);
+    }
+
+    private void finishFileChoice(Uri[] value) {
+        ValueCallback<Uri[]> callback = fileCallback;
+        fileCallback = null;
+        if (callback != null) callback.onReceiveValue(value);
     }
 
     @Override
-    public void onBackPressed() {
-        if (web.canGoBack()) web.goBack();
-        else super.onBackPressed();
+    protected void onDestroy() {
+        finishFileChoice(null);
+        removeBridge();
+        if (web != null) {
+            ViewGroup parent = (ViewGroup) web.getParent();
+            if (parent != null) parent.removeView(web);
+            web.destroy();
+        }
+        super.onDestroy();
     }
 }

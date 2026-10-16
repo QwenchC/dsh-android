@@ -1,12 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="file_picker_unavailable">No file picker is available on this device.</string>
     <string name="app_name">DSH</string>
     <string name="channel_runtime">Harness runtime</string>
     <string name="channel_runtime_description">Keeps the on-device DeepSeek Harness server running.</string>
     <string name="notification_starting">Starting the harness…</string>
     <string name="notification_ready">Serving %1$s</string>
-    <string name="notification_failed">The harness stopped unexpectedly</string>
-    <string name="notification_stopped">The harness is stopped</string>
     <string name="state_installing">Unpacking the runtime…</string>
     <string name="state_starting">Starting the harness…</string>
     <string name="state_failed">The harness could not start</string>
@@ -45,18 +44,35 @@
     <string name="notification_awake">Holding the processor awake so a turn survives the screen going off. Stop the harness from its menu to release it.</string>
     <string name="workspace_private">App storage: %1$s</string>
     <string name="workspace_shared">Shared storage: %1$s</string>
-    <string name="workspace_saved">Workspace updated; new sessions use it.</string>
+    <string name="workspace_saved">Workspace saved for the next harness start. Existing sessions retain their recorded location.</string>
     <string name="storage_granted">Shared storage available.</string>
     <string name="shared_offer_title">Move the project to shared storage?</string>
     <string name="shared_offer_message">DSH can keep its projects in /sdcard/DSH instead of a folder private to the app. Files there open in other applications, appear in your file manager, and survive reinstalling the app. New sessions use the new location.</string>
     <string name="shared_offer_accept">Use /sdcard/DSH</string>
     <string name="shared_offer_decline">Keep it private</string>
-    <string name="shared_offer_done">New sessions now work in /sdcard/DSH.</string>
     <string name="move_started">Moving the project to shared storage…</string>
-    <string name="move_done">Moved %1$d files (%2$d already there). Projects now live in %3$s.</string>
-    <string name="move_none">Nothing to move: no project files were found in DSH\'s own storage.</string>
     <string name="move_needs_storage">Grant all-files access first; without it nothing can be written to shared storage.</string>
     <string name="menu_move">Move project to shared storage</string>
     <string name="choose_file">Choose a file</string>
     <string name="download_failed">This download needs a browser.</string>
+    <string name="state_stopping">Stopping the harness…</string>
+    <string name="workspace_stop_first">Stop the harness before changing the workspace. Existing sessions keep their recorded project location.</string>
+    <string name="move_stop_message">This stops the harness and any active turn, then copies and verifies your projects. Original files stay in place. Conflicts or failures keep the current workspace unchanged. Start the harness again after the copy.</string>
+    <string name="move_stop_copy">Stop and copy</string>
+    <string name="move_verified">Copied %1$d; verified identical: %2$d. Workspace: %3$s. Original files are retained. Start the harness to use this location; earlier sessions keep their recorded project location.</string>
+    <string name="move_failed">The workspace was not changed. Original files are retained. Resolve the following problems and retry:
+%1$s</string>
+    <string name="move_busy">A project copy is already running.</string>
+    <string name="menu_execution">Tool execution permissions</string>
+    <string name="execution_explanation">Default: confirm tools that can change files or run code. Read and search tools continue directly. Changes apply after stopping and starting the harness, including resumed sessions. This adds approval; Android commands still have no project sandbox.</string>
+    <string name="execution_confirm">Require confirmation</string>
+    <string name="execution_autonomous">Autonomous execution</string>
+    <string name="execution_warning">Autonomous mode allows tools without this additional confirmation. Commands and code can access DSH’s private files, including credentials, and any shared files allowed by Android. A working directory does not confine commands. Enable only for projects and instructions you trust.</string>
+    <string name="execution_enable">Enable autonomous mode</string>
+    <string name="execution_saved">Execution preference saved. Stop and start the harness to apply it.</string>
+    <string name="file_outside_workspace">This file is outside the active project. Open it through its project instead.</string>
+    <string name="link_no_browser">No browser is available for this link.</string>
+    <string name="storage_older_android">Shared project folders require Android 11 or later in this version. App-private projects remain available.</string>
+    <string name="battery_settings_hint">Select DSH in Android battery settings to change background restrictions.</string>
+    <string name="battery_settings_missing">Battery settings are unavailable on this device.</string>
 </resources>

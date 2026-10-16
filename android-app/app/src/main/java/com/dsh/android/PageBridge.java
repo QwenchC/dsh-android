@@ -6,7 +6,6 @@ import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.net.Uri;
 import android.provider.DocumentsContract;
-import android.webkit.JavascriptInterface;
 import android.webkit.MimeTypeMap;
 import android.webkit.WebView;
 import android.widget.Toast;
@@ -22,7 +21,8 @@ import java.io.File;
  * the preview as the alternative, because the in-product view remains a
  * legitimate choice.
  *
- * The object is reached from injected script as `window.DSHAndroid`.
+ * The origin-restricted WebMessage listener receives only main-frame messages.
+ * Injected script reaches it as `window.DSHAndroid.postMessage`.
  */
 final class PageBridge {
 
@@ -40,15 +40,26 @@ final class PageBridge {
     /**
      * Ask how to open one file the conversation produced.
      *
-     * Called from the page's JavaScript on a background thread, so every piece
-     * of user interface work is posted to the activity.
+     * MainActivity validates the sending origin and main frame before calling here.
+     * Canonical workspace containment is checked before showing any file metadata.
      *
      * @param path - the path exactly as the conversation spelled it: absolute,
      * or relative to the session's workspace.
      */
-    @JavascriptInterface
     public void openFile(String path) {
-        activity.runOnUiThread(() -> ask(absolute(path)));
+        if (path == null || path.length() > 32768) return;
+        activity.runOnUiThread(() -> {
+            try {
+                File file = absolute(path).getCanonicalFile();
+                if (!inside(runtime.servedWorkspace(), file) && !inside(runtime.privateWorkspace(), file)) {
+                    Toast.makeText(activity, R.string.file_outside_workspace, Toast.LENGTH_LONG).show();
+                    return;
+                }
+                ask(file);
+            } catch (java.io.IOException | IllegalArgumentException invalid) {
+                Toast.makeText(activity, R.string.file_open_missing, Toast.LENGTH_SHORT).show();
+            }
+        });
     }
 
     /**
@@ -65,13 +76,17 @@ final class PageBridge {
     private File absolute(String path) {
         File named = new File(path);
         if (named.isAbsolute()) return named;
-        File current = new File(runtime.workspace(), path);
+        File current = new File(runtime.servedWorkspace(), path);
         if (current.exists()) return current;
-        return new File(new File(RuntimeLayout.root(activity), "workspace"), path);
+        return new File(runtime.privateWorkspace(), path);
+    }
+
+    private static boolean inside(File root, File file) throws java.io.IOException {
+        return file.getPath().startsWith(root.getCanonicalPath() + File.separator);
     }
 
     private void ask(File file) {
-        if (!file.exists()) {
+        if (!file.isFile()) {
             Toast.makeText(activity, R.string.file_open_missing, Toast.LENGTH_SHORT).show();
             return;
         }
@@ -123,7 +138,7 @@ final class PageBridge {
             return new Uri.Builder()
                     .scheme("content")
                     .authority(activity.getPackageName() + ProjectFilesProvider.AUTHORITY_SUFFIX)
-                    .encodedPath("/" + relative)
+                    .path("/" + relative)
                     .build();
         }
         String external = android.os.Environment.getExternalStorageDirectory().getAbsolutePath();
@@ -139,7 +154,7 @@ final class PageBridge {
         int dot = name.lastIndexOf('.');
         if (dot >= 0) {
             String guessed = MimeTypeMap.getSingleton()
-                    .getMimeTypeFromExtension(name.substring(dot + 1).toLowerCase());
+                    .getMimeTypeFromExtension(name.substring(dot + 1).toLowerCase(java.util.Locale.ROOT));
             if (guessed != null) return guessed;
         }
         return "application/octet-stream";
@@ -154,7 +169,7 @@ final class PageBridge {
      * `__dshAndroidResume` replays the click when the preview is chosen.
      */
     static final String SCRIPT = "(function () {"
-            + "if (window.__dshAndroidInstalled) return;"
+            + "if (!window.DSHAndroid || window.__dshAndroidInstalled) return;"
             + "window.__dshAndroidInstalled = true;"
             + "window.__dshAndroidPending = null;"
             + "window.__dshAndroidResume = function () {"
@@ -173,7 +188,7 @@ final class PageBridge {
             + "        event.preventDefault();"
             + "        event.stopPropagation();"
             + "        window.__dshAndroidPending = node;"
-            + "        window.DSHAndroid.openFile(path);"
+            + "        window.DSHAndroid.postMessage(path);"
             + "        return;"
             + "      }"
             + "    }"

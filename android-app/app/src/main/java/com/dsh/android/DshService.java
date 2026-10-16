@@ -23,19 +23,24 @@ public final class DshService extends Service {
     /** Starts the service, which starts the runtime. */
     static void start(Context context) {
         Intent intent = new Intent(context, DshService.class);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent);
-        else context.startService(intent);
+        context.startForegroundService(intent);
     }
 
-    /** Stops the service without stopping the runtime. */
+    /** Stops the service and requests nonblocking runtime cleanup. */
     static void stop(Context context) {
         context.stopService(new Intent(context, DshService.class));
     }
 
     @Override
-    public int onStartCommand(Intent intent, int flags, int startId) {
-        startForeground(NOTIFICATION_ID, notification(getString(R.string.notification_starting)));
+    public void onCreate() {
+        super.onCreate();
         DshApp.runtime().addListener(listener);
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        if (!DshApp.runtime().autoStart()) { stopSelf(); return START_NOT_STICKY; }
+        startForeground(NOTIFICATION_ID, notification(getString(R.string.notification_starting)));
         DshApp.runtime().start();
         return START_STICKY;
     }
@@ -43,6 +48,8 @@ public final class DshService extends Service {
     @Override
     public void onDestroy() {
         DshApp.runtime().removeListener(listener);
+        main.removeCallbacksAndMessages(null);
+        DshApp.runtime().stop();
         super.onDestroy();
     }
 
@@ -51,28 +58,28 @@ public final class DshService extends Service {
         return null;
     }
 
-    private final DshRuntime.Listener listener = (state, detail) -> {
-        String text;
-        switch (state) {
-            case READY: text = getString(R.string.notification_ready, detail); break;
-            case FAILED: text = getString(R.string.notification_failed); break;
-            case STOPPED: text = getString(R.string.notification_stopped); break;
-            default: text = getString(R.string.notification_starting); break;
+    private final android.os.Handler main = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final DshRuntime.Listener listener = (state, detail) -> main.post(() -> {
+        if (state != DshApp.runtime().state()) return;
+        if (state == DshRuntime.State.STOPPED || state == DshRuntime.State.FAILED) {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+            stopSelf();
+            return;
         }
+        String text = state == DshRuntime.State.READY
+                ? getString(R.string.notification_ready, "http://127.0.0.1:" + DshApp.runtime().port())
+                : getString(R.string.notification_starting);
         android.app.NotificationManager manager = getSystemService(android.app.NotificationManager.class);
         if (manager != null) manager.notify(NOTIFICATION_ID, notification(text));
-    };
+    });
 
     private Notification notification(String text) {
         Intent open = new Intent(this, MainActivity.class);
         open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
-        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) flags |= PendingIntent.FLAG_IMMUTABLE;
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
         PendingIntent content = PendingIntent.getActivity(this, 0, open, flags);
 
-        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? new Notification.Builder(this, DshApp.CHANNEL_RUNTIME)
-                : new Notification.Builder(this);
+        Notification.Builder builder = new Notification.Builder(this, DshApp.CHANNEL_RUNTIME);
         builder.setContentTitle(getString(R.string.app_name))
                 .setContentText(text)
                 .setSmallIcon(android.R.drawable.stat_sys_download_done)
@@ -91,6 +98,7 @@ public final class DshService extends Service {
     public void onTimeout(int startId) {
         // Android 15 bounds some foreground service types; the runtime keeps its
         // process only while the notification stands, so honour the timeout.
+        DshApp.runtime().stop();
         stopSelf();
     }
 

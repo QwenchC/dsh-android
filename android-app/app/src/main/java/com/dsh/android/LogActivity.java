@@ -15,7 +15,8 @@ public final class LogActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable refresh = new Runnable() {
         @Override public void run() {
-            output.setText(DshApp.runtime().logText() + crashText());
+            output.setText(DshApp.runtime().logText());
+            output.append(crashText());
             handler.postDelayed(this, 1000);
         }
     };
@@ -33,6 +34,7 @@ public final class LogActivity extends Activity {
         output.setPadding(padding, padding, padding, padding);
         scroll.addView(output, new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        EdgeToEdge.apply(this, scroll);
         setContentView(scroll);
     }
 

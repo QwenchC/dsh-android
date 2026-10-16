@@ -5,6 +5,10 @@ Android, delivered as an installable application. The phone runs the Harness its
 agent loop, the tools, the session log, and the Web UI all execute on the device, with no
 desktop host, no Termux, and no companion process anywhere else.
 
+Download: [DSH for Android 0.1.4](https://github.com/QwenchC/dsh-android/releases/tag/v0.1.4)
+(debug-signed APK, arm64-v8a + x86_64, Android 8.0+). See the
+[release notes](docs/releases/v0.1.4.md) for tested environments and remaining limits.
+
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │ Android application (com.dsh.android)                                │
@@ -66,10 +70,25 @@ subsystem.
 
 ## Build
 
+The current toolchain is JDK 21, Android SDK 37, Gradle 9.8.1, and pinned **AGP
+9.5.0-alpha09 (preview)**. This AGP version and a pinned KGP 2.4.21 build dependency
+remove upstream Gradle deprecations; the Java-only app disables Kotlin compilation
+through the module DSL. See [toolchain validation](docs/verification.md#15-agp-and-kotlin-build-deprecations--2026-10-15)
+for the preview-version tradeoff and strict verification checks. Java compilation also
+rejects deprecated platform APIs. See [platform compatibility results](docs/verification.md#16-android-platform-api-deprecations-and-compatibility--2026-10-15)
+for the 0.1.3 migration and Android 8/16/17 tests. The [Android 8 UI acceptance](docs/verification.md#17-android-8-webview-and-production-ui-acceptance--2026-10-15)
+records the compatible provider, real model approvals and the 0.1.4 mobile-settings fix.
+
 Everything is driven from this directory. The build host is Windows with WSL2; WSL performs
 the ELF work, PowerShell drives the packaging.
 
 ```powershell
+# 0. Prepare the pinned upstream source and apply both port patches once
+git clone https://github.com/deepseek-ai/deepseek-harness.git dsh-harness
+git -C dsh-harness checkout ddefc45fbc7f8e46dd73185e68295696d1297887
+git -C dsh-harness apply ../patches/android-port.patch
+git -C dsh-harness apply ../patches/android-mobile-settings.patch
+
 # 1. The Node runtime for Android (Termux packages, relocated for the APK)
 wsl -d Ubuntu-24.04 -u root -- bash /mnt/e/Lumi/DSH-Android/scripts/build-node-runtime.sh
 
@@ -116,7 +135,7 @@ an otherwise correct intent fail.
 the project folder, the file list, and the actions that used to live in an
 options menu no activity bar ever showed — so nothing overlaps the interface.
 
-![The application bar and the file dialog](images/file-open-dialog.png)
+![The application bar and the file dialog](docs/images/file-open-dialog.png)
 
 - **`Project folder` opens the device's file manager at the workspace.** A
   folder on shared storage has a document URI any file manager understands, and
@@ -124,7 +143,7 @@ options menu no activity bar ever showed — so nothing overlaps the interface.
   URI and nothing outside the sandbox can list it, so the action says that
   instead and offers the grant and the move that fix it.
 
-  ![The project folder in the device's file manager](images/project-folder.png)
+  ![The project folder in the device's file manager](docs/images/project-folder.png)
 
 - **A file reference in a conversation asks how to open.** The Harness renders
   one as a button carrying the path; the page hands that path to the
@@ -134,18 +153,18 @@ options menu no activity bar ever showed — so nothing overlaps the interface.
   beside names, a tap opening the file with the device's preferred application
   and a long press offering the explicit chooser. This is the only way into a
   private workspace, and it says so when the workspace is private.
-- **With shared storage granted, the Harness's own home is the shared
+- **After selecting the shared workspace and restarting, the Harness's own home is the shared
   folder.** The Harness's directory picker offers its process home as *Home*,
   and a project created there is what the user expects to find in a file
-  manager. So `HOME` points at `/sdcard/DSH` once access is granted, and new
+  manager. So `HOME` points at `/sdcard/DSH` after selecting that workspace and restarting, and new
   projects are visible outside the application from the moment they exist.
   `DSH_HOME` does not move: sessions and credentials stay private.
-- **The move action copies real projects, wherever they are.** A project lives
+- **The copy action stops the Harness and verifies real projects.** A project lives
   either in the application's own workspace or in a directory under the Harness
   home, so both are copied — the workspace's contents, and each home directory
-  as a directory that keeps its name. Nothing is replaced, the Harness's own
-  state directory is never touched, and an empty move says so instead of
-  reporting zero files.
+  as a directory that keeps its name. Existing files are skipped only when their SHA-256 content matches. Conflicts or failures
+  prevent changing the workspace; original files and the Harness state directory are retained.
+  Start the Harness again after a successful copy. Earlier sessions retain their original paths.
 
   ```
   /sdcard/DSH
@@ -175,11 +194,17 @@ is tried and the application's own file list is the last resort.
 
 ## Running with the screen off
 
+Version 0.1.4 includes cancellable startup, verified project copying, per-tool confirmation,
+and an origin-restricted WebView bridge. See [Android reliability and permissions](docs/android-hardening.md)
+for behavior, restart requirements, and repeatable tests. The default is **Require confirmation**;
+**Autonomous execution** is an explicit native-menu opt-in that takes effect after Stop/Start.
+Commands still execute with the application's Android permissions.
+
 A foreground service keeps the *process* alive; it does not keep the *processor*
 alive. Once the screen goes off the device suspends, the event loop stops
 turning, and a model request stalls mid-stream until something wakes the device.
-The application therefore holds a partial wake lock for exactly as long as the
-Harness runs, and states that cost in its notification.
+The application therefore holds a partial wake lock while the Harness runs, with a
+five-minute timeout renewed each minute, and states that cost in its notification.
 
 Two consequences worth knowing:
 
@@ -188,8 +213,8 @@ Two consequences worth knowing:
   processor awake once nothing is running.
 - **Network access in deep idle is a separate permission.** The platform defers
   network for an idle application even with a wake lock held. The
-  *Battery: unrestricted* menu action asks for the exemption that prevents it;
-  it is a user decision, so the port requests it rather than claiming it.
+  *Battery: unrestricted* menu action opens Android's battery optimization list;
+  the user selects DSH and decides whether to grant an exemption there.
 
 ## Limitations
 
@@ -204,11 +229,17 @@ something the platform cannot back up.
   process, and a Harness that ran commands unconfined while reporting them as confined would
   be lying. The Android application sandbox (a unique uid with no access outside its own
   directories) is the real boundary.
+- **The Web UI requires a compatible WebView.** Stock Android 8 Chrome/WebView 69
+  cannot parse the bundled JavaScript. Full page rendering and real-model approvals
+  passed on API 26 x86_64 with Chrome/WebView **119.0.6045.194**; this is a frozen
+  compatibility-test provider, not a currently security-supported browser. The tested
+  138/132 x86_64 libraries fail to load on that old image. See the dated acceptance
+  record before reproducing this environment; ARM64 Android 8 hardware is unverified.
 - **Image attachments are unavailable.** `sharp` publishes no Android build, so raster
   normalization fails at the first image. Text and document attachments work.
 - **Office document conversion is off.** The bundled LibreOffice engine is a desktop binary.
 - **"Open In..." is off.** Android has no desktop application registry to resolve.
-- **Shared storage needs a grant.** The default workspace is app-private. Choosing a folder
+- **Shared storage needs a grant and Android 11+.** The default workspace is app-private. Choosing a folder
   on `/sdcard` requires the all-files-access permission, which the app requests from its
   menu; without it Android's scoped storage hides those directories from the picker.
 
@@ -242,3 +273,27 @@ tool, and grep, and the session log was published to disk.
 
 [docs/verification.md](docs/verification.md) records the full run, every failure
 that shaped the port, and what was not verified.
+
+The API 26+ platform suite uses no model credentials and checks native insets, real
+keyboard show/hide, browser storage, real file-input upload, picker results and
+activity recreation. On a disposable emulator:
+
+```powershell
+scripts/verify-app.ps1 -Offline -DeviceSerial emulator-5584 -DeviceSuite PlatformCompatibility
+```
+
+The default device suite remains the broader API 29+ runtime/security regressions.
+Platform-suite results and the old-WebView limitation are recorded separately in
+[the dated validation record](docs/verification.md#16-android-platform-api-deprecations-and-compatibility--2026-10-15).
+
+Version 0.1.4 also adapts Settings below 600 CSS pixels: section navigation becomes a
+horizontal rail and controls use the full dialog width. The upstream change is
+retained in `patches/android-mobile-settings.patch`; the packaged settings client
+bundle differs only in this CSS.
+
+The **2026-10-16 emulator recheck** passed all 15 API 26 platform groups, four
+production UI groups and three real DeepSeek approval interactions on x86_64 with
+Chrome/WebView 119. Screenshot capture now waits for the display to settle after
+the WebView visual callback. Android 8 ARM64 emulator startup experiments did not
+produce a usable system, so ARM64 runtime and physical-device acceptance remain
+pending. See [the follow-up record](docs/verification.md#18-emulator-follow-up-and-arm64-startup-diagnostics--2026-10-16).

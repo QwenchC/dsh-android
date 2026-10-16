@@ -1,15 +1,18 @@
 package com.dsh.android;
 
-import android.os.Build;
+import android.app.Activity;
 import android.view.View;
-import android.view.WindowInsets;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsCompat;
 
 /**
  * Keeps a screen's content between the system bars.
  *
  * Android 15 draws every application edge to edge, so the status and navigation
  * bars are painted over the content unless the content reserves their space.
- * Both activities here are full-window surfaces, so each applies the inset to
+ * Each activity is a full-window surface, so it applies the inset to
  * its root view once, and the keyboard's inset is included so a text field is
  * never left under it.
  */
@@ -18,28 +21,16 @@ final class EdgeToEdge {
     private EdgeToEdge() {}
 
     /** Reserve the system-bar and keyboard space on a root view. */
-    static void apply(View root) {
-        root.setOnApplyWindowInsetsListener((view, insets) -> {
-            int left;
-            int top;
-            int right;
-            int bottom;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                android.graphics.Insets bars = insets.getInsets(
-                        WindowInsets.Type.systemBars() | WindowInsets.Type.ime());
-                left = bars.left;
-                top = bars.top;
-                right = bars.right;
-                bottom = bars.bottom;
-            } else {
-                left = insets.getSystemWindowInsetLeft();
-                top = insets.getSystemWindowInsetTop();
-                right = insets.getSystemWindowInsetRight();
-                bottom = insets.getSystemWindowInsetBottom();
-            }
-            view.setPadding(left, top, right, bottom);
+    static void apply(Activity activity, View root) {
+        WindowCompat.setDecorFitsSystemWindows(activity.getWindow(), false);
+        final int left = root.getPaddingLeft(), top = root.getPaddingTop();
+        final int right = root.getPaddingRight(), bottom = root.getPaddingBottom();
+        ViewCompat.setOnApplyWindowInsetsListener(root, (view, insets) -> {
+            Insets safe = insets.getInsets(WindowInsetsCompat.Type.systemBars()
+                    | WindowInsetsCompat.Type.ime() | WindowInsetsCompat.Type.displayCutout());
+            view.setPadding(left + safe.left, top + safe.top, right + safe.right, bottom + safe.bottom);
             return insets;
         });
-        root.requestApplyInsets();
+        ViewCompat.requestApplyInsets(root);
     }
 }

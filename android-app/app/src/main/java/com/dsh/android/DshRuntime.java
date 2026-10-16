@@ -21,8 +21,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -41,7 +39,6 @@ public final class DshRuntime {
     /** Preferences holding the workspace choice and the last installed stamp. */
     private static final String PREFS = "dsh";
     private static final String PREF_WORKSPACE = "workspace";
-    private static final String PREF_SHARED_STORAGE = "shared_storage";
 
     /** Lines of process output the log view keeps in memory. */
     private static final int LOG_RING = 400;
@@ -50,55 +47,56 @@ public final class DshRuntime {
     private static final long READY_TIMEOUT_MS = 180_000L;
 
     /** Lifecycle of the managed process. */
-    public enum State { IDLE, INSTALLING, STARTING, READY, FAILED, STOPPED }
+    public enum State { IDLE, INSTALLING, STARTING, READY, STOPPING, FAILED, STOPPED }
 
-    /** Receives every state transition on the runtime's worker thread. */
+    /** Receives transitions on the calling thread; UI consumers post to the main thread. */
     public interface Listener {
         /** @param state the new state; {@code detail} explains a failure. */
         void onRuntimeState(State state, String detail);
     }
 
     private final Context context;
-    private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
-        Thread thread = new Thread(r, "dsh-runtime");
-        thread.setDaemon(true);
-        return thread;
-    });
     private final List<Listener> listeners = new CopyOnWriteArrayList<>();
     private final ArrayDeque<String> recentLog = new ArrayDeque<>();
 
-    private volatile State state = State.IDLE;
-    private volatile String detail = "";
-    /**
-     * Keeps the CPU running while the Harness does.
-     *
-     * A foreground service keeps the process alive but not the processor:
-     * once the screen goes off the device suspends, the event loop stops
-     * turning, an in-flight model request stalls mid-stream, and nothing
-     * resumes until something wakes the device. The lock is what makes a turn
-     * survive the screen going off, and it is released the moment the runtime
-     * stops.
-     */
-    private android.os.PowerManager.WakeLock wakeLock;
-
-    private volatile Process process;
-    private volatile int port;
-    private volatile String baseUrl;
-    /** The origin the runtime printed, which carries the session's access token. */
-    private volatile String announcedUrl;
+    private RenewingLease wakeLease;
+    private final java.util.concurrent.ScheduledExecutorService wakeTimer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(task -> {
+        Thread thread = new Thread(task, "dsh-wake-lease"); thread.setDaemon(true); return thread;
+    });
+    private InputStream outputStream;
+    private Thread outputPump;
+    private volatile File runningWorkspace;
+    private final RuntimeController controller;
 
     DshRuntime(Context context) {
         this.context = context.getApplicationContext();
+        controller = new RuntimeController(new RuntimeController.Backend() {
+            public void install(RuntimeController.Run run) throws Exception { installRuntime(run); }
+            public void prepare(RuntimeController.Run run) throws Exception {
+                prepareDirectories();
+                installPolicy();
+                runningWorkspace = workspace();
+            }
+            public void acquire() { acquireWakeLock(); }
+            public Process launch(RuntimeController.Run run) throws Exception {
+                run.port = freePort();
+                return DshRuntime.this.launch(run);
+            }
+            public String readyUrl(RuntimeController.Run run) { return run.approvalReady ? run.announcedUrl : null; }
+            public void release() {
+                try { closeOutput(); } finally { releaseWakeLock(); runningWorkspace = null; }
+            }
+        }, (next, why) -> transition(State.valueOf(next.name()), why), READY_TIMEOUT_MS, 5000);
     }
 
     /** The current state. */
     public State state() {
-        return state;
+        return State.valueOf(controller.state().name());
     }
 
     /** The explanation attached to the current state; empty when there is none. */
     public String detail() {
-        return detail;
+        return controller.detail();
     }
 
     /** The loopback origin the runtime prints, token included. */
@@ -107,18 +105,18 @@ public final class DshRuntime {
 
     /** The Web UI origin once {@link State#READY}, otherwise null. */
     public String baseUrl() {
-        return baseUrl;
+        return controller.url();
     }
 
     /** The port the Web UI is served on once {@link State#READY}, otherwise 0. */
     public int port() {
-        return port;
+        return controller.port();
     }
 
     /** Registers a listener and immediately reports the current state to it. */
     public void addListener(Listener listener) {
-        listeners.add(listener);
-        listener.onRuntimeState(state, detail);
+        if (!listeners.contains(listener)) listeners.add(listener);
+        notifyListener(listener, state(), detail());
     }
 
     /** Removes a listener. */
@@ -133,108 +131,89 @@ public final class DshRuntime {
         return text.toString();
     }
 
-    /** Starts installation and the server unless a run is already in flight. */
-    public synchronized void start() {
-        if (state == State.INSTALLING || state == State.STARTING || state == State.READY) return;
-        worker.execute(this::run);
+    /** Starts one run; repeated calls while starting, stopping, or copying are ignored. */
+    public void start() { controller.start(); }
+
+    /** Cancels startup or execution without blocking the caller. */
+    public void stop() { controller.stop(); }
+
+    public boolean isRunning() { return controller.busy(); }
+
+    public boolean autoStart() {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("auto_start", true);
     }
 
-    /** Stops the server and everything it spawned. */
-    public synchronized void stop() {
-        Process running = process;
-        process = null;
-        if (running != null) {
-            running.destroy();
-            try {
-                if (!running.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) running.destroyForcibly();
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                running.destroyForcibly();
-            }
-        }
-        baseUrl = null;
-        releaseWakeLock();
-        transition(State.STOPPED, "");
+    public void setAutoStart(boolean enabled) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("auto_start", enabled).apply();
     }
 
-    /** Whether the process is alive. */
-    public boolean isRunning() {
-        Process running = process;
-        return running != null && running.isAlive();
+    public boolean autonomous() {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("autonomous", false);
     }
 
-    private void run() {
-        try {
-            announcedUrl = null;
-            File root = RuntimeLayout.root(context);
-            if (!root.isDirectory() && !root.mkdirs()) {
-                fail("cannot create the runtime root at " + root);
-                return;
-            }
-            installRuntime();
-            prepareDirectories();
-            acquireWakeLock();
-            int selected = freePort();
-            transition(State.STARTING, "port " + selected);
-            Process started = launch(selected);
-            process = started;
-            port = selected;
-            if (!awaitReady(started)) {
-                if (state == State.STARTING) {
-                    fail(started.isAlive()
-                            ? "the Web UI did not announce its origin on port " + selected + " within "
-                              + (READY_TIMEOUT_MS / 1000) + "s"
-                            : "the runtime exited with code " + started.exitValue());
-                }
-                return;
-            }
-            baseUrl = announcedUrl;
-            transition(State.READY, baseUrl);
-            started.waitFor();
-            if (process == started) {
-                process = null;
-                baseUrl = null;
-                releaseWakeLock();
-                transition(State.STOPPED, "the runtime exited with code " + started.exitValue());
-            }
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            releaseWakeLock();
-        } catch (Exception failure) {
-            Log.e(TAG, "runtime start failed", failure);
-            releaseWakeLock();
-            fail(String.valueOf(failure.getMessage()));
-        }
+    /** The changed authority applies on the next start. */
+    public void setAutonomous(boolean enabled) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("autonomous", enabled).apply();
     }
 
-    /** Hold the processor awake for as long as the Harness runs. */
+    public File servedWorkspace() {
+        File active = runningWorkspace;
+        return active == null ? workspace() : active;
+    }
+
+    /** Stop writers before copying; switch roots only after every file passes verification. */
+    java.util.concurrent.CompletableFuture<ProjectMigration.Result> migrate(File destination) {
+        setAutoStart(false);
+        return controller.maintain(() -> {
+            if (!hasSharedStorage()) throw new IOException("shared-storage permission is unavailable");
+            ProjectMigration.Result result = ProjectMigration.copy(privateWorkspace(), RuntimeLayout.home(context), destination);
+            if (result.complete()) {
+                boolean saved = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                        .putString(PREF_WORKSPACE, destination.getAbsolutePath()).commit();
+                if (!saved) result.failures.add("could not save the new workspace");
+            }
+            return result;
+        });
+    }
+
+    /** A five-minute CPU lease renews each minute while this runtime owns it. */
     private void acquireWakeLock() {
-        if (wakeLock != null && wakeLock.isHeld()) return;
         android.os.PowerManager power = (android.os.PowerManager) context.getSystemService(Context.POWER_SERVICE);
-        if (power == null) return;
-        android.os.PowerManager.WakeLock lock =
-                power.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "dsh:harness");
+        if (power == null) throw new IllegalStateException("power service is unavailable");
+        android.os.PowerManager.WakeLock lock = power.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "dsh:harness");
         lock.setReferenceCounted(false);
-        lock.acquire();
-        wakeLock = lock;
-        appendLog("[runtime] holding the processor awake while the harness runs");
+        wakeLease = new RenewingLease(new RenewingLease.Resource() {
+            public void acquire(long timeoutMillis) { lock.acquire(timeoutMillis); }
+            public void release() { if (lock.isHeld()) lock.release(); }
+        }, (task, delay) -> {
+            java.util.concurrent.ScheduledFuture<?> future = wakeTimer.schedule(task, delay, java.util.concurrent.TimeUnit.MILLISECONDS);
+            return () -> future.cancel(false);
+        }, () -> {
+            appendLog("[runtime] CPU lease renewal failed; stopping the harness");
+            stop();
+        }, 300_000, 60_000);
+        wakeLease.start();
+        appendLog("[runtime] holding a renewable, bounded CPU lease while the harness runs");
     }
 
-    /** Release the processor; the runtime is no longer running. */
     private void releaseWakeLock() {
-        android.os.PowerManager.WakeLock lock = wakeLock;
-        wakeLock = null;
-        if (lock != null && lock.isHeld()) lock.release();
+        RenewingLease lease = wakeLease;
+        if (lease != null) { lease.stop(); wakeLease = null; }
     }
 
     /** Extracts the packaged runtime tree when the installed stamp is stale. */
-    private void installRuntime() throws IOException {
+    private void installRuntime(RuntimeController.Run run) throws IOException {
         String stamp = stampValue();
-        File installed = new File(RuntimeLayout.root(context), RuntimeLayout.STAMP_FILE);
+        File root = RuntimeLayout.root(context);
+        if (!root.isDirectory() && !root.mkdirs()) throw new IOException("cannot create " + root);
+        File live = RuntimeLayout.runtime(context);
+        File previous = new File(root, "runtime.previous");
+        if (!live.exists() && previous.exists() && !previous.renameTo(live)) throw new IOException("cannot restore previous runtime");
+        File installed = new File(live, RuntimeLayout.STAMP_FILE);
         if (RuntimeLayout.cliEntry(context).isFile() && stamp.equals(readStamp(installed))) return;
 
-        transition(State.INSTALLING, "unpacking the runtime");
-        File runtime = RuntimeLayout.runtime(context);
+        run.installing();
+        File runtime = new File(root, "runtime.installing");
         deleteTree(runtime);
         if (!runtime.mkdirs() && !runtime.isDirectory()) throw new IOException("cannot create " + runtime);
 
@@ -243,6 +222,7 @@ public final class DshRuntime {
             ZipEntry entry;
             byte[] buffer = new byte[64 * 1024];
             while ((entry = zip.getNextEntry()) != null) {
+                run.check();
                 File target = new File(runtime, entry.getName());
                 if (!isInside(runtime, target)) throw new IOException("unsafe entry " + entry.getName());
                 if (entry.isDirectory()) {
@@ -254,7 +234,7 @@ public final class DshRuntime {
                     }
                     try (OutputStream out = new FileOutputStream(target)) {
                         int read;
-                        while ((read = zip.read(buffer)) > 0) out.write(buffer, 0, read);
+                        while ((read = zip.read(buffer)) > 0) { run.check(); out.write(buffer, 0, read); }
                     }
                     // Helper executables travel inside the archive: the
                     // runtime's own bin/ scripts and node-pty's spawn-helper,
@@ -267,9 +247,19 @@ public final class DshRuntime {
                 zip.closeEntry();
             }
         }
-        try (OutputStream out = new FileOutputStream(installed)) {
+        run.check();
+        try (OutputStream out = new FileOutputStream(new File(runtime, RuntimeLayout.STAMP_FILE))) {
             out.write(stamp.getBytes(StandardCharsets.UTF_8));
         }
+        if (!new File(runtime, "lib/bin.js").isFile()) throw new IOException("runtime CLI is missing");
+        run.check();
+        deleteTree(previous);
+        if (live.exists() && !live.renameTo(previous)) throw new IOException("cannot retain previous runtime");
+        if (!runtime.renameTo(live)) {
+            if (previous.exists()) previous.renameTo(live);
+            throw new IOException("cannot activate runtime");
+        }
+        deleteTree(previous);
         appendLog("[runtime] installed " + entries + " entries");
     }
 
@@ -294,7 +284,8 @@ public final class DshRuntime {
     }
 
     /** Starts the CLI's {@code web} profile and streams its output into the log. */
-    private Process launch(int selectedPort) throws IOException {
+    private Process launch(RuntimeController.Run run) throws IOException {
+        int selectedPort = run.port;
         List<String> command = new ArrayList<>();
         command.add(RuntimeLayout.nodeExecutable(context).getAbsolutePath());
         // The Cordis loader reaches Node's internal module loader directly when
@@ -303,7 +294,10 @@ public final class DshRuntime {
         // disabled by exposing internals here.
         command.add("--expose-internals");
         command.add(RuntimeLayout.cliEntry(context).getAbsolutePath());
+        command.add("--profile");
         command.add("web");
+        command.add("--patch");
+        command.add(new File(RuntimeLayout.root(context), "android-policy.patch.yml").getAbsolutePath());
         command.add("--host");
         command.add("127.0.0.1");
         command.add("--port");
@@ -311,7 +305,7 @@ public final class DshRuntime {
         command.add("--no-open");
 
         ProcessBuilder builder = new ProcessBuilder(command);
-        builder.directory(workspace());
+        builder.directory(servedWorkspace());
         builder.redirectErrorStream(true);
         Map<String, String> env = builder.environment();
         // The Harness's directory picker offers its process home as "Home", and
@@ -319,7 +313,7 @@ public final class DshRuntime {
         // manager. With shared storage granted the home is that shared folder,
         // so the picker starts where the projects belong; the Harness's own
         // state stays in DSH_HOME, which is private either way.
-        File home = hasSharedStorage() ? workspace() : RuntimeLayout.home(context);
+        File home = hasSharedStorage() ? servedWorkspace() : RuntimeLayout.home(context);
         env.put("HOME", home.getAbsolutePath());
         env.put("DSH_HOME", RuntimeLayout.dshHome(context).getAbsolutePath());
         env.put("TMPDIR", RuntimeLayout.tmp(context).getAbsolutePath());
@@ -333,9 +327,9 @@ public final class DshRuntime {
         env.put("PATH", RuntimeLayout.bin(context).getAbsolutePath()
                 + ":" + RuntimeLayout.nodeExecutable(context).getParentFile().getAbsolutePath()
                 + ":/system/bin:/system/xbin");
-        // The application sandbox is the boundary on Android, and the file-effect
-        // policy stays available per session; the default states that split.
-        env.put("DSH_PERMISSION_MODE", "danger-full-access");
+        // File tools use workspace-write; command admission is a separate gate.
+        env.put("DSH_PERMISSION_MODE", "workspace-write");
+        env.put("DSH_ANDROID_AUTONOMOUS", autonomous() ? "1" : "0");
         File bash = RuntimeLayout.bash(context);
         if (bash != null) env.put("DSH_ANDROID_SHELL", bash.getAbsolutePath());
         File ripgrep = RuntimeLayout.ripgrep(context);
@@ -343,17 +337,38 @@ public final class DshRuntime {
 
         appendLog("[runtime] " + String.join(" ", command));
         Process started = builder.start();
-        Thread pump = new Thread(() -> pump(started.getInputStream()), "dsh-runtime-log");
+        run.own(started);
+        InputStream stream = started.getInputStream();
+        outputStream = stream;
+        Thread pump = new Thread(() -> pump(run, stream), "dsh-runtime-log");
+        outputPump = pump;
         pump.setDaemon(true);
         pump.start();
         return started;
     }
 
-    private void pump(InputStream stream) {
+    /** Drain the exited process, then close a pipe held open by an unmanaged descendant. */
+    private void closeOutput() {
+        Thread pump = outputPump;
+        InputStream stream = outputStream;
+        outputPump = null;
+        outputStream = null;
+        try {
+            if (pump != null) pump.join(500);
+            if (stream != null) stream.close();
+            if (pump != null && pump.isAlive()) pump.join(500);
+        } catch (IOException closed) {
+            Log.w(TAG, "runtime output could not be closed", closed);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void pump(RuntimeController.Run run, InputStream stream) {
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                captureUrl(line);
+                captureUrl(run, line);
                 appendLog(line);
             }
         } catch (IOException ignored) {
@@ -369,30 +384,27 @@ public final class DshRuntime {
      * rather than an origin this application guessed from the port number.
      * @param line - one line of runtime output.
      */
-    private void captureUrl(String line) {
+    private void captureUrl(RuntimeController.Run run, String line) {
+        if ("[android-policy] active".equals(line)) run.approvalReady = true;
         Matcher match = LOOPBACK_URL.matcher(line);
-        if (match.find()) announcedUrl = match.group();
+        if (match.find() && TrustedOrigin.allows("http://127.0.0.1:" + run.port, match.group())) run.announcedUrl = match.group();
     }
 
-    /**
-     * Wait until the runtime prints the origin it serves.
-     *
-     * Readiness is that line, not an answered request: the server refuses an
-     * unauthenticated request with 401 — which is still an answer — so probing
-     * the port can win the race against the printed URL and hand the WebView an
-     * origin that carries no token. The printed URL is the only origin this
-     * activation authorizes.
-     * @param started - the runtime process, watched for early exit.
-     * @returns whether the origin was announced before the deadline.
-     */
-    private boolean awaitReady(Process started) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + READY_TIMEOUT_MS;
-        while (System.currentTimeMillis() < deadline) {
-            if (!started.isAlive()) return false;
-            if (announcedUrl != null) return true;
-            Thread.sleep(200);
+    private void installPolicy() throws IOException {
+        for (String name : new String[] { "android-policy.mjs", "android-policy.patch.yml" }) {
+            try (InputStream input = context.getAssets().open(name)) {
+                java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+                byte[] chunk = new byte[4096]; int count;
+                while ((count = input.read(chunk)) != -1) bytes.write(chunk, 0, count);
+                byte[] content = bytes.toByteArray();
+                if (name.endsWith(".yml")) {
+                    String template = new String(content, StandardCharsets.UTF_8);
+                    String module = new File(RuntimeLayout.root(context), "android-policy.mjs").toURI().toASCIIString();
+                    content = PolicyConfig.materialize(template, module).getBytes(StandardCharsets.UTF_8);
+                }
+                java.nio.file.Files.write(new File(RuntimeLayout.root(context), name).toPath(), content);
+            }
         }
-        return false;
     }
 
     /** A loopback port no other process holds. */
@@ -409,8 +421,7 @@ public final class DshRuntime {
         SharedPreferences preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         String configured = preferences.getString(PREF_WORKSPACE, null);
         if (configured != null && configured.length() > 0) {
-            File chosen = new File(configured);
-            if (chosen.isDirectory() || chosen.mkdirs()) return chosen;
+            return new File(configured);
         }
         return new File(RuntimeLayout.root(context), "workspace");
     }
@@ -432,29 +443,22 @@ public final class DshRuntime {
                 .edit().putString(PREF_WORKSPACE, directory.getAbsolutePath()).apply();
     }
 
-    /** Whether the runtime may write outside the application sandbox. */
+    /** Read the OS grant each time; a revoked permission cannot survive in preferences. */
     public boolean hasSharedStorage() {
-        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(PREF_SHARED_STORAGE, false);
-    }
-
-    /** Records the outcome of the all-files-access request. */
-    public void setSharedStorage(boolean granted) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .edit().putBoolean(PREF_SHARED_STORAGE, granted).apply();
+        return android.os.Build.VERSION.SDK_INT >= 30 && android.os.Environment.isExternalStorageManager();
     }
 
     private void transition(State next, String why) {
-        state = next;
-        detail = why == null ? "" : why;
-        for (Listener listener : listeners) listener.onRuntimeState(next, detail);
+        for (Listener listener : listeners) notifyListener(listener, next, why);
     }
 
-    private void fail(String why) {
-        Log.e(TAG, "runtime failed: " + why);
-        transition(State.FAILED, why == null ? "unknown failure" : why);
+    private void notifyListener(Listener listener, State state, String detail) {
+        try { listener.onRuntimeState(state, detail); }
+        catch (RuntimeException failure) { Log.w(TAG, "runtime listener failed", failure); }
     }
 
     private synchronized void appendLog(String line) {
+        line = line.replaceAll("([?&]token=)[A-Za-z0-9_-]+", "$1[redacted]");
         recentLog.addLast(line);
         while (recentLog.size() > LOG_RING) recentLog.removeFirst();
         try (OutputStream out = new FileOutputStream(RuntimeLayout.log(context), true)) {
@@ -496,7 +500,8 @@ public final class DshRuntime {
     }
 
     private static void deleteTree(File file) {
-        if (file == null || !file.exists()) return;
+        if (file == null || !java.nio.file.Files.exists(file.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)) return;
+        if (java.nio.file.Files.isSymbolicLink(file.toPath())) { file.delete(); return; }
         File[] children = file.listFiles();
         if (children != null) for (File child : children) deleteTree(child);
         //noinspection ResultOfMethodCallIgnored

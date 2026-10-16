@@ -1,0 +1,8 @@
+# Applied last by the Android carrier; admission and process confinement are independent.
+- id: approval
+  config:
+    policy: ask
+
+- insert:
+    - id: android-tool-approval
+      name: "__ANDROID_POLICY_MODULE_URI__"

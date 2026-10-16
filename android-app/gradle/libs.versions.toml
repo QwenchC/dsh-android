@@ -1,13 +1,16 @@
 [versions]
-agp = "9.1.1"
-androidxAppcompat = "1.7.1"
-androidxWebkit = "1.14.0"
-androidxCore = "1.17.0"
+# Preview required for the upstream Configuration.setVisible removal (issue 565740572).
+agp = "9.5.0-alpha09"
+androidxWebkit = "1.17.1"
+androidxActivity = "1.13.0"
+androidxCore = "1.19.1"
+junit = "4.13.2"
 
 [libraries]
-androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "androidxAppcompat" }
 androidx-webkit = { group = "androidx.webkit", name = "webkit", version.ref = "androidxWebkit" }
+androidx-activity = { group = "androidx.activity", name = "activity", version.ref = "androidxActivity" }
 androidx-core = { group = "androidx.core", name = "core", version.ref = "androidxCore" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

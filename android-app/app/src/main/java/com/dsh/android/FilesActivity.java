@@ -32,7 +32,7 @@ import java.util.List;
  * application the device already prefers for its type, and offers the explicit
  * "open with" chooser only as a second action.
  */
-public final class FilesActivity extends Activity {
+public final class FilesActivity extends androidx.activity.ComponentActivity {
 
     /** The external storage provider's authority, for files that live on shared storage. */
     private static final String EXTERNAL_STORAGE_DOCUMENTS = "com.android.externalstorage.documents";
@@ -50,9 +50,17 @@ public final class FilesActivity extends Activity {
         root = DshApp.runtime().workspace();
         current = root;
         View content = buildContentView();
-        EdgeToEdge.apply(content);
+        EdgeToEdge.apply(this, content);
         setContentView(content);
         refresh();
+        getOnBackPressedDispatcher().addCallback(this, new androidx.activity.OnBackPressedCallback(true) {
+            @Override public void handleOnBackPressed() {
+                if (!current.equals(root) && current.getParentFile() != null) {
+                    current = current.getParentFile();
+                    refresh();
+                } else { finish(); }
+            }
+        });
     }
 
     private View buildContentView() {
@@ -244,7 +252,7 @@ public final class FilesActivity extends Activity {
             return new Uri.Builder()
                     .scheme("content")
                     .authority(getPackageName() + ProjectFilesProvider.AUTHORITY_SUFFIX)
-                    .encodedPath("/" + relative)
+                    .path("/" + relative)
                     .build();
         }
         String external = android.os.Environment.getExternalStorageDirectory().getAbsolutePath();
@@ -264,7 +272,7 @@ public final class FilesActivity extends Activity {
         int dot = name.lastIndexOf('.');
         if (dot >= 0) {
             String guessed = MimeTypeMap.getSingleton()
-                    .getMimeTypeFromExtension(name.substring(dot + 1).toLowerCase());
+                    .getMimeTypeFromExtension(name.substring(dot + 1).toLowerCase(java.util.Locale.ROOT));
             if (guessed != null) return guessed;
         }
         return "application/octet-stream";
@@ -292,13 +300,4 @@ public final class FilesActivity extends Activity {
         }
     }
 
-    @Override
-    public void onBackPressed() {
-        if (!current.equals(root) && current.getParentFile() != null) {
-            current = current.getParentFile();
-            refresh();
-            return;
-        }
-        super.onBackPressed();
-    }
 }

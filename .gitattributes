@@ -1,0 +1,3 @@
+# Patch context includes a required single-space prefix on blank lines.
+# Keep downloadable patch bytes usable on every platform.
+patches/*.patch text eol=lf whitespace=-blank-at-eol
